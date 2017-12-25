@@ -4,6 +4,7 @@
 
 package scaled.pacman;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
@@ -39,8 +40,7 @@ public class Bootstrap {
   static final String PACMAN_CLASS = "scaled.pacman.Pacman";
 
   static final Path USER_HOME = Paths.get(System.getProperty("user.home"));
-  static final Path JRE_HOME = Paths.get(System.getProperty("java.home"));
-  static final Path JAVA_HOME = JRE_HOME.getParent();
+  static final Path JAVA_HOME = findJavaHome();
 
   static boolean DEBUG = false;
   static void debug (String message) { if (DEBUG) System.err.println("▸ " + message); }
@@ -57,6 +57,8 @@ public class Bootstrap {
   public static void main (String[] args) throws Throwable {
     // parse our command line arguments (do this early so that we honor -d ASAP)
     Args pargs = parseArgs(args);
+    debug("Java home: " + JAVA_HOME);
+    debug("User home: " + USER_HOME);
     // determine where Scaled is (or should be) installed
     Path scaledHome = findScaledHome();
     debug("Scaled home: " + scaledHome);
@@ -66,6 +68,16 @@ public class Bootstrap {
     Path pacmanRoot = checkoutPacman(scaledHome);
     // build Pacman if needed
     Path pacmanJar = buildPacman(pacmanRoot, mfetcherJar);
+
+    // on Windows we need to copy pacman's module.jar to a temporary file to avoid freakout when
+    // pacman tries to rebuild itself; yay Windows (also no Props here because we're in Bootstrap)
+    if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+      File tempJar = File.createTempFile("pacman", ".jar", pacmanJar.getParent().toFile());
+      tempJar.deleteOnExit();
+      Path runtimeJar = tempJar.toPath();
+      Files.copy(pacmanJar, runtimeJar, StandardCopyOption.REPLACE_EXISTING);
+      pacmanJar = runtimeJar;
+    }
 
     // if we have any JVM arguments, we need to fork, otherwise we can reuse this JVM
     if (pargs.jvmArgs.isEmpty()) {
@@ -120,6 +132,16 @@ public class Bootstrap {
     }
   }
 
+  static Path findJavaHome () {
+    Path javaHome = Paths.get(System.getProperty("java.home"));
+    // java.home may be JDK_HOME/jre
+    if (Files.exists(javaHome.getParent().resolve("release"))) {
+      return javaHome.getParent();
+    }
+    // otherwise hopefully it points to the JDK home, so use it as is
+    return javaHome;
+  }
+
   static Path findScaledHome () {
     // if a special home was specified via envvar, use it
     String scaledHomeEnv = System.getenv("SCALED_HOME");
@@ -131,6 +153,9 @@ public class Bootstrap {
     // if we're on a Mac, use Library/Application Support/Scaled
     Path appsup = USER_HOME.resolve("Library").resolve("Application Support");
     if (Files.exists(appsup)) return appsup.resolve("Scaled");
+    // if we're on (newish) Windows, use AppData/Local
+    Path apploc = USER_HOME.resolve("AppData").resolve("Local");
+    if (Files.exists(apploc)) return apploc.resolve("Scaled");
     // otherwise use ~/.scaled (where ~ is user.home)
     return USER_HOME.resolve(".scaled");
   }
@@ -219,7 +244,9 @@ public class Bootstrap {
     // build the code
     note("Compiling Scaled package manager...");
     Path binJavac = JAVA_HOME.resolve("bin").resolve("javac");
-    exec(pacmanRoot, binJavac.toString(), "-classpath", mfetcherJar.toString(),
+    exec(pacmanRoot, binJavac.toString(),
+         "-encoding", System.getProperty("file.encoding"),
+         "-classpath", mfetcherJar.toString(),
          "-d", classesDir.toString(), "@target/pacman.sources");
 
     // finally create the module.jar file

@@ -9,12 +9,8 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.function.Consumer;
 
 /** The main command line entry point for the Scaled Package Manager. */
@@ -25,17 +21,19 @@ public class Pacman {
     "",
     "where <command> is one of:",
     "",
-    "  list [--all]                         lists installed (or all) packages",
-    "  search text                          lists all packages in directory which match text",
-    "  refresh                              updates the package directory index",
-    "  install [pkg-name | pkg-url]         installs package (by name or url) and its depends",
-    "  upgrade [pkg-name]                   upgrades package and its depends",
-    "  info [pkg-name | --all]              prints detailed info on pkg-name (or all packages)",
-    "  deptree pkg-name                     prints depend tree for (all modules in) pkg-name",
-    "  depends pkg-name#module              prints flattened depend list pkg-name#module",
     "  build pkg-name [--deps]              cleans and builds pkg-name (and depends if --deps)",
     "  clean pkg-name [--deps]              cleans pkg-name (and its depends if --deps)",
-    "  run pkg-name#module class [arg ...]  runs class from pkg-name#module with args"
+    "  depends pkg-name#module              prints flattened depend list pkg-name#module",
+    "  deptree pkg-name                     prints depend tree for (all modules in) pkg-name",
+    "  info [pkg-name | --all]              prints detailed info on pkg-name (or all packages)",
+    "  install [pkg-name | pkg-url]         installs package (by name or url) and its depends",
+    "  list [--all]                         lists installed (or all) packages",
+    "  rebuild [from-pkg-name]              cleans and rebuilds all installed packages",
+    "                                       continues rebuild at from-pkg-name if supplied",
+    "  refresh                              updates the package directory index",
+    "  run pkg-name#module class [arg ...]  runs class from pkg-name#module with args",
+    "  search text                          lists all packages in directory which match text",
+    "  upgrade [pkg-name]                   upgrades package and its depends"
   };
 
   public static final Printer out = new Printer(System.out);
@@ -55,17 +53,18 @@ public class Pacman {
     // we'll introduce proper arg parsing later; for now KISS
     try {
       switch (args[0]) {
-        case    "list": list(optarg(args, 1, "").equals("--all")); break;
-        case  "search": search(optarg(args, 1, "")); break;
-        case "refresh": refresh(); break;
-        case "install": install(tail(args, 1)); break;
-        case "upgrade": upgrade(arg(args, 1)); break;
+        case     "run": run(arg(args, 1), arg(args, 2), tail(args, 3)); break;
         case    "info": info(arg(args, 1)); break;
-        case "deptree": deptree(arg(args, 1)); break;
-        case "depends": depends(arg(args, 1)); break;
+        case    "list": list(optarg(args, 1, "").equals("--all")); break;
         case   "build": build(arg(args, 1), optarg(args, 2, "").equals("--deps")); break;
         case   "clean": clean(arg(args, 1), optarg(args, 2, "").equals("--deps")); break;
-        case     "run": run(arg(args, 1), arg(args, 2), tail(args, 3)); break;
+        case  "search": search(optarg(args, 1, "")); break;
+        case "depends": depends(arg(args, 1)); break;
+        case "deptree": deptree(arg(args, 1)); break;
+        case "install": install(tail(args, 1)); break;
+        case "rebuild": buildAll(optarg(args, 1, "")); break;
+        case "refresh": refresh(); break;
+        case "upgrade": upgrade(arg(args, 1)); break;
         default: fail(USAGE); break;
       }
     } catch (MissingArgException mae) {
@@ -100,6 +99,7 @@ public class Pacman {
   private static void list (boolean all) {
     List<String[]> info = new ArrayList<>();
     for (Package pkg : repo.packages()) info.add(tuple(pkg.name, pkg.descrip));
+    info.sort((i1, i2) -> i1[0].compareTo(i2[0]));
     if (!info.isEmpty()) info.add(0, tuple("Installed:", ""));
     if (all) {
       if (!info.isEmpty()) info.add(tuple("", ""));
@@ -197,6 +197,101 @@ public class Pacman {
         out.println(id);
       }
     });
+  }
+
+  private static void buildAll (String pkgName) {
+    List<Package> toBuild = repo.topoPackages();
+    int[] procsToThreads = { 1, 1, 1, 2, 2, 3, 4, 5, 6 };
+    int procs = Math.min(Runtime.getRuntime().availableProcessors(), procsToThreads.length-1);
+    int threads = procsToThreads[procs];
+    Log.log("Building up to " + threads + " packages in parallel.");
+
+    class Builder {
+      private CountDownLatch done = new CountDownLatch(threads);
+      private Set<Source> built = new HashSet<>();
+      private List<String> failMsgs = new ArrayList<>();
+      private List<Exception> failErrs = new ArrayList<>();
+
+      private synchronized Package getNext () {
+        if (done()) return null;
+
+        Package next = toBuild.remove(0);
+        while (!next.dependsSatisfied(built)) {
+          debug("Waiting for depends: " + next.name);
+          try {
+            wait();
+          } catch (InterruptedException ie) {
+            fail("Interrupted waiting to build " + next.root);
+          }
+          // if another build failed while we were waiting, abandon ship
+          if (!failMsgs.isEmpty()) {
+            return null;
+          }
+        }
+        return next;
+      }
+
+      private synchronized boolean done () {
+        return toBuild.isEmpty() || !failMsgs.isEmpty();
+      }
+
+      private synchronized void noteBuilt (Package pkg) {
+        built.add(pkg.source);
+        notifyAll();
+      }
+
+      private synchronized void noteFailed (Package pkg, Exception err) {
+        failMsgs.add("Failure invoking 'build' in: " + pkg.root);
+        failErrs.add(err);
+        notifyAll();
+      }
+
+      private void runThread () {
+        Package next;
+        while ((next = getNext()) != null) {
+          try {
+            new PackageBuilder(repo, next).build();
+            noteBuilt(next);
+          } catch (Exception e) {
+            noteFailed(next, e);
+          }
+        }
+        done.countDown();
+      }
+
+      public synchronized void noteSkipped (Package pkg) {
+        Log.log("Skipping " + pkg.name + "...");
+        built.add(pkg.source);
+      }
+
+      public void run () {
+        for (int ii = 0; ii < threads; ii++) {
+          new Thread() { public void run () { runThread(); }}.start();
+        }
+
+        try {
+          done.await();
+        } catch (InterruptedException ie) {
+          fail("Interrupted waiting for build to complete.");
+        }
+
+        if (!failMsgs.isEmpty()) {
+          for (int ii = 0; ii < failMsgs.size(); ii++) {
+            System.err.println(failMsgs.get(ii));
+            failErrs.get(ii).printStackTrace(System.err);
+          }
+          System.exit(255);
+        }
+      }
+    }
+
+    Builder builder = new Builder();
+    if (!pkgName.equals("")) {
+      while (!toBuild.isEmpty() && !toBuild.get(0).name.equals(pkgName)) {
+        builder.noteSkipped(toBuild.remove(0)); // for depends tracking
+      }
+    }
+    builder.run();
   }
 
   private static void build (String pkgName, boolean deps) {

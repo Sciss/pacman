@@ -41,10 +41,15 @@ public class PackageFetcher {
     _vcs.update(_pkgDir);
   }
 
-  /** Installs the fetche package into its proper location in the package repository. */
+  /** Installs the fetche packaged into its proper location in the package repository. */
   public void install (Package pkg) throws IOException {
     Path target = _repo.packageDir(pkg.name);
-    Files.move(_pkgDir, target, StandardCopyOption.ATOMIC_MOVE);
+    // windows can die in a fire
+    if (Props.isWindows) {
+      Filez.copyAll(_pkgDir, target);
+    } else {
+      Files.move(_pkgDir, target, StandardCopyOption.ATOMIC_MOVE);
+    }
     _repo.addPackage(target.resolve(Package.FILE));
   }
 
