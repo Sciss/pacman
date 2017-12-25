@@ -1,9 +1,11 @@
-name             := "pacman"
-version          := "1.0"
-description      := "The Scaled Package Manager"
-licenses         := Seq("New BSD" -> url("https://raw.githubusercontent.com/scaled/pacman/master/LICENSE"))
-scalaVersion     := "2.12.4"
-autoScalaLibrary := false
+name               := "pacman"
+version            := "0.1.0-SNAPSHOT"
+description        := "The Scaled Package Manager"
+licenses           := Seq("New BSD" -> url("https://raw.githubusercontent.com/scaled/pacman/master/LICENSE"))
+scalaVersion       := "2.12.4"
+autoScalaLibrary   := false
+crossPaths         := false
+organization       := "de.sciss"
 
 libraryDependencies ++= Seq(
   "com.samskivert" % "mfetcher"        % "1.0.5",
